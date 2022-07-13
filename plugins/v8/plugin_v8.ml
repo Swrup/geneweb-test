@@ -445,6 +445,169 @@ let misc = fun assets conf -> function
 let w_base fn conf = function Some base ->  fn conf base
                             | None -> false
 
+(* taken from stdlib
+ * TODO: replace by Array.combine once we get to ocaml>=4.13 *)
+let array_combine a b =
+  let open Array in
+  let na = length a in
+  let nb = length b in
+  if na <> nb then invalid_arg "Array.combine";
+  if na = 0 then [||]
+  else begin
+    let x = make na (unsafe_get a 0, unsafe_get b 0) in
+    for i = 1 to na - 1 do
+      unsafe_set x i (unsafe_get a i, unsafe_get b i)
+    done;
+    x
+  end
+
+let pop_pyr_handler assets conf base =
+  let open Util in
+  let open Def in
+  let open BirthDeath in
+  match base with
+  | None ->
+    Printf.eprintf "Invalid request: no base";
+    false
+  | Some base ->
+    let interval =
+      match p_getint conf.env "int" with None -> 5 | Some i -> max 1 i
+    in
+    let limit = match p_getint conf.env "lim" with None -> 0 | Some x -> x in
+    let at_date =
+      match p_getint conf.env "y" with
+      | None -> conf.today
+      | Some i -> { year = i; month = 31; day = 12; prec = Sure; delta = 0 }
+    in
+    let humans =
+      let men, wom =
+        make_population_pyramid ~nb_intervals:(150 / interval) ~interval ~limit
+          ~at_date conf base
+      in
+      let humans = array_combine men wom in
+      (* remove the lasts empty intervals *)
+      Array.fold_right
+        (fun ((nb_men, nb_wom) as v) acc ->
+          (* if it's empty we have seen only 0s and should keep on removing intervals, otherwise we should stop removing them *)
+          if acc = [] && nb_men = 0 && nb_wom = 0 then [] else v :: acc )
+        humans []
+    in
+
+    let half_row_to_string =
+      let rec count_digit n =
+        if n < 0 then
+          if n > -10 then 2 (* minus sign *) else 1 + count_digit (n / 10)
+        else if n < 10 then 1
+        else 1 + count_digit (n / 10)
+      in
+      let max_hum =
+        List.fold_left (fun acc (a, b) -> max acc (max a b)) 1 humans
+      in
+      let date_size = count_digit max_hum in
+      let max_number_sign = 20 in
+      let nb_of_number_sign n =
+        let nb = n * max_number_sign / max_hum in
+        min nb max_number_sign
+      in
+      fun ~reverse nb ->
+        let nb_number_sign = nb_of_number_sign nb in
+        let number_signs = String.make nb_number_sign '#' in
+        let nb_whitespace =
+          date_size - count_digit nb + max_number_sign - nb_number_sign
+        in
+        let whitespace =
+          let non_breaking_space = "&nbsp;" in
+          let buf =
+            Buffer.create (nb_whitespace * String.length non_breaking_space)
+          in
+          for _i = 0 to nb_whitespace do
+            Buffer.add_string buf non_breaking_space
+          done;
+          Buffer.contents buf
+        in
+
+        if reverse then Printf.sprintf "  %s %d%s" number_signs nb whitespace
+        else Printf.sprintf "%s%d %s  " whitespace nb number_signs
+    in
+
+    let make_row date nb_men nb_wom =
+      let td_date = T.td [ T.pcdata (string_of_int date) ] in
+      let td_men =
+        T.td [ T.pcdata (half_row_to_string ~reverse:false nb_men) ]
+      in
+      let td_wom =
+        T.td [ T.pcdata (half_row_to_string ~reverse:true nb_wom) ]
+      in
+      let td_age =
+        T.td [ T.pcdata (string_of_int (at_date.year - date + interval)) ]
+      in
+      T.tr [ td_date; td_men; td_age; td_wom; td_date ]
+    in
+
+    let rows =
+      List.rev
+      @@ List.mapi
+           (fun i (nb_men, nb_wom) ->
+             make_row (at_date.year - (i * interval)) nb_men nb_wom )
+           humans
+    in
+    let title = Printf.sprintf "Population pyramid (%d)" at_date.year in
+    let body = [ T.h1 [ T.pcdata title ]; T.table rows ] in
+    let page = skeleton assets [] body in
+    render conf page;
+    true
+
+let sosa_handler assets conf base =
+  let error_page msg =
+    let title = Printf.sprintf "Incorrect request: %s" msg in
+    let body = [ T.h1 [ T.pcdata title ] ] in
+    let page = skeleton assets [] body in
+    let () = render conf page in
+    false
+  in
+
+  match base with
+  | None -> error_page "no base"
+  | Some base -> (
+    match Util.find_person_in_env conf base "" with
+    | None -> error_page "invalid person"
+    | Some person -> (
+      match Util.p_getint conf.env "sosa" with
+      | None -> error_page "invalid sosa"
+      | Some n when n < 1 -> error_page "invalid sosa"
+      | Some n -> (
+        let get f person =
+          let open Gwdb in
+          match get_parents person with
+          | None -> None
+          | Some ifam -> foi base ifam |> f |> poi base |> Option.some
+        in
+
+        let rec sosa n path =
+          if n = 1 then path
+          else
+            sosa (n / 2)
+              ( (if n mod 2 = 0 then Gwdb.get_father else Gwdb.get_mother)
+              :: path )
+        in
+
+        let l = sosa n [] in
+        let ancestor_opt =
+          List.fold_left
+            (fun person_opt f -> Option.bind person_opt (get f))
+            (Some person) l
+        in
+        match ancestor_opt with
+        | None -> error_page "couldn't find ancestor"
+        | Some ancestor ->
+          let first_name = Gwdb.sou base (Gwdb.get_first_name ancestor) in
+          let surname = Gwdb.sou base (Gwdb.get_surname ancestor) in
+          let title = Printf.sprintf "%s %s" first_name surname in
+          let body = [ T.h1 [ T.pcdata title ] ] in
+          let page = skeleton assets [] body in
+          render conf page;
+          true ) ) )
+
 let () =
   let module H = Handler in
   print_endline (__LOC__ ^ ": " ^ !Gwd_lib.GwdPlugin.assets) ;
@@ -480,4 +643,6 @@ let () =
         | Some s -> H.some_sn assets conf base s
         | _ -> H.alln true assets conf base
       end
-    ]
+    ; "POP_PYR", pop_pyr_handler
+    ; "SOSA", sosa_handler
+    ];
